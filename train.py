@@ -12,7 +12,12 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+# import new loss which considers weighted mask
+from utils.loss_utils import l1_loss, ssim, new_loss
+import cv2
+import torch
+import torchvision.transforms as transforms
+
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -22,6 +27,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import GaussianScoreTracker
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,6 +47,66 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+# def createTestMask(gt_image):
+#     # Get image dimensions
+#     height, width = gt_image.shape[1], gt_image.shape[2]
+    
+#     # Define mask size (you can adjust these values)
+#     mask_size = 0.4  # This means 40% of the image's width and height will have high weight
+    
+#     # Calculate the region to focus on
+#     start_height = int(height * (1 - mask_size) / 2)
+#     end_height = int(height * (1 + mask_size) / 2)
+#     start_width = int(width * (1 - mask_size) / 2)
+#     end_width = int(width * (1 + mask_size) / 2)
+    
+#     # Create a mask with low weight (0) everywhere
+#     weight_mask = torch.zeros_like(gt_image, dtype=torch.float32, device=gt_image.device)
+    
+#     # Set the middle region to high weight (1)
+#     weight_mask[:, start_height:end_height, start_width:end_width] = 1.0
+    
+#     return weight_mask
+    
+#     # Example 3: Apply a custom mask (e.g., from an image)
+#     # Assuming you have an external image (e.g., from a .png or .jpg file), you could read it and resize it
+#     # to match the shape of gt_image, then use it as the weight mask.
+#     # For instance:
+#     # from PIL import Image
+#     # mask_img = Image.open("path_to_mask_image.png").convert('L')
+#     # mask = torch.tensor(np.array(mask_img), dtype=torch.float32, device=gt_image.device)
+#     # mask = mask.unsqueeze(0).repeat(C, 1, 1)  # Repeat for each channel
+#     # return weight_mask
+
+
+# def getWeightMask(gt_image, image_name):
+#     #image_name = "DSC0" + image_name[4:]
+#     directory_mask = r".\360_v2\garden\images_mask"
+#     path_mask = os.path.abspath(os.path.join(directory_mask, image_name))
+#     weight_mask = cv2.imread(path_mask, cv2.IMREAD_GRAYSCALE)
+
+#     if weight_mask is None:
+#         raise ValueError(f"Failed to load weight mask from {image_name}")
+
+#     # Resize the weight mask to match the ground truth image size (assuming gt_image is a tensor)
+#     transform = transforms.Compose([
+#         transforms.ToPILImage(),  # Convert tensor to PIL image for resizing
+#         transforms.Resize((gt_image.shape[1], gt_image.shape[2])),  # Match height and width
+#         transforms.ToTensor(),  # Convert back to tensor
+#     ])
+    
+#     weight_mask = transform(weight_mask).float().to(gt_image.device)  # Ensure it's a float tensor
+#     #print(weight_mask)
+#         # Convert the tensor back to a NumPy array for visualization with OpenCV
+#     # weight_mask_cpu = weight_mask.squeeze(0).cpu().numpy()  # Remove channel dimension if it's 1
+#     # weight_mask_cpu = (weight_mask_cpu * 255).astype('uint8')  # Convert to 8-bit for display
+#     # cv2.imshow(f"Weight Mask: {image_name}", weight_mask_cpu)
+#     # cv2.waitKey(0)  # Wait for a key press to close the window
+#     # cv2.destroyAllWindows()  # Close the window
+
+#     return weight_mask
+    
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -56,6 +123,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    # initialise weight mask
+    weight_mask = None
+    # initialise score tracker
+    gaussianScoreTracker = GaussianScoreTracker.GaussianScoreTracker(ema_alpha=0.1)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -88,6 +159,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
+        print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
+        print(f"Memory reserved: {torch.cuda.memory_reserved() / 1e9:.3f} GB")
+
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -110,6 +184,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        #gaussian_scores = render_pkg["gaussian_scores"]
+        gaussianScoreTracker.update(render_pkg["gaussian_scores"])
+
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -117,13 +194,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        weight_mask = viewpoint_cam.mask.cuda()
+        #weight_mask = getWeightMask(gt_image, viewpoint_cam.image_name)
+        
+        # Replace L1 loss
+        #Ll1 = l1_loss(image, gt_image)
+        #LNew = new_loss(image, gt_image, weight_mask)
+        LNew = l1_loss(image, gt_image)
+        
+        # print("fused ssim avail: " + str(FUSED_SSIM_AVAILABLE))
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        # Replace total loss calculation
+        #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss = (1.0 - opt.lambda_dssim) * LNew + opt.lambda_dssim * (1.0 - ssim_value)
+        #loss = LNew
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -155,20 +243,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            # Replace Ll1 & l1_loss function with new respective ones
+            #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, LNew, loss, new_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
+                gaussian_scores = gaussianScoreTracker.get_scores()
+
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, gaussian_scores)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -211,10 +303,10 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, LNew, total_loss, new_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/LNew', LNew.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', total_loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
@@ -230,6 +322,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    weight_mask = createTestMask(gt_image) #TODO
+
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
@@ -237,7 +331,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
+                    l1_test += new_loss(image, gt_image, weight_mask).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          

@@ -406,12 +406,16 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, gaussian_scores, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        #selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        
+        adjusted_grad_threshold = GaussianScoreScaler.sqrt(grad_threshold, gaussian_scores, n_init_points, alpha=1)
+        selected_pts_mask = padded_grad >= adjusted_grad_threshold
+        
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -432,9 +436,13 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, gaussian_scores, scene_extent):
         # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        #selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        
+        adjusted_grad_threshold = GaussianScoreScaler.sqrt(grad_threshold, gaussian_scores, self.get_xyz.shape[0], alpha=1)
+        selected_pts_mask = torch.norm(grads, dim=-1) >= adjusted_grad_threshold
+        
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
@@ -449,22 +457,24 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, gaussian_scores):
+        """Densification process with gradient thresholding and pruning."""
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # Compute percentiles for monitoring
+        with torch.no_grad():
+            stats = [torch.quantile(gaussian_scores, p).item() for p in [0.25, 0.5, 0.75, 0.85, 0.95, 1.0]]
+            print(f"Gaussian Stats: 25th={stats[0]:.3f}, median={stats[1]:.3f}, 75th={stats[2]:.3f}, 85th={stats[3]:.3f}, 95th={stats[4]:.3f}, max={stats[5]:.3f}")
+
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent, gaussian_scores)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            prune_mask |= self.max_radii2D > max_screen_size
+            prune_mask |= self.get_scaling.max(dim=1).values > 0.1 * extent
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
-        self.tmp_radii = None
 
         torch.cuda.empty_cache()
 
