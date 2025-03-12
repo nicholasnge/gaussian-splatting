@@ -13,7 +13,7 @@ import os
 import torch
 from random import randint
 # import new loss which considers weighted mask
-from utils.loss_utils import l1_loss, ssim, new_loss
+from utils.loss_utils import l1_loss, ssim
 import cv2
 import torch
 import torchvision.transforms as transforms
@@ -47,26 +47,26 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-# def createTestMask(gt_image):
-#     # Get image dimensions
-#     height, width = gt_image.shape[1], gt_image.shape[2]
+def createTestMask(gt_image):
+    # Get image dimensions
+    height, width = gt_image.shape[1], gt_image.shape[2]
     
-#     # Define mask size (you can adjust these values)
-#     mask_size = 0.4  # This means 40% of the image's width and height will have high weight
+    # Define mask size (you can adjust these values)
+    mask_size = 0.4  # This means 40% of the image's width and height will have high weight
     
-#     # Calculate the region to focus on
-#     start_height = int(height * (1 - mask_size) / 2)
-#     end_height = int(height * (1 + mask_size) / 2)
-#     start_width = int(width * (1 - mask_size) / 2)
-#     end_width = int(width * (1 + mask_size) / 2)
+    # Calculate the region to focus on
+    start_height = int(height * (1 - mask_size) / 2)
+    end_height = int(height * (1 + mask_size) / 2)
+    start_width = int(width * (1 - mask_size) / 2)
+    end_width = int(width * (1 + mask_size) / 2)
     
-#     # Create a mask with low weight (0) everywhere
-#     weight_mask = torch.zeros_like(gt_image, dtype=torch.float32, device=gt_image.device)
+    # Create a mask with low weight (0) everywhere
+    weight_mask = torch.zeros_like(gt_image, dtype=torch.float32, device=gt_image.device)
     
-#     # Set the middle region to high weight (1)
-#     weight_mask[:, start_height:end_height, start_width:end_width] = 1.0
+    # Set the middle region to high weight (1)
+    weight_mask[:, start_height:end_height, start_width:end_width] = 1.0
     
-#     return weight_mask
+    return weight_mask
     
 #     # Example 3: Apply a custom mask (e.g., from an image)
 #     # Assuming you have an external image (e.g., from a .png or .jpg file), you could read it and resize it
@@ -159,8 +159,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
-        print(f"Memory reserved: {torch.cuda.memory_reserved() / 1e9:.3f} GB")
+        #print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
+        #print(f"Memory reserved: {torch.cuda.memory_reserved() / 1e9:.3f} GB")
 
         gaussians.update_learning_rate(iteration)
 
@@ -245,7 +245,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save
             # Replace Ll1 & l1_loss function with new respective ones
             #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            training_report(tb_writer, iteration, LNew, loss, new_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, LNew, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -331,7 +331,7 @@ def training_report(tb_writer, iteration, LNew, total_loss, new_loss, elapsed, t
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += new_loss(image, gt_image, weight_mask).mean().double()
+                    l1_test += new_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
