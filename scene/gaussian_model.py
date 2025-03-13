@@ -413,8 +413,8 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         #selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        
-        adjusted_grad_threshold = GaussianScoreScaler.log(grad_threshold, gaussian_scores, n_init_points, alpha=1)
+        adjusted_grad_threshold = grad_threshold
+        #adjusted_grad_threshold = GaussianScoreScaler.log(grad_threshold, gaussian_scores, n_init_points, alpha=1)
         selected_pts_mask = padded_grad >= adjusted_grad_threshold
         
         selected_pts_mask = torch.logical_and(selected_pts_mask,
