@@ -414,7 +414,7 @@ class GaussianModel:
         padded_grad[:grads.shape[0]] = grads.squeeze()
         #selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         
-        adjusted_grad_threshold = GaussianScoreScaler.sqrt(grad_threshold, gaussian_scores, n_init_points, alpha=1)
+        adjusted_grad_threshold = GaussianScoreScaler.log(grad_threshold, gaussian_scores, n_init_points, alpha=1)
         selected_pts_mask = padded_grad >= adjusted_grad_threshold
         
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -441,7 +441,7 @@ class GaussianModel:
         # Extract points that satisfy the gradient condition
         #selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
-        adjusted_grad_threshold = GaussianScoreScaler.sqrt(grad_threshold, gaussian_scores, self.get_xyz.shape[0], alpha=1)
+        adjusted_grad_threshold = GaussianScoreScaler.log(grad_threshold, gaussian_scores, self.get_xyz.shape[0], alpha=1)
         selected_pts_mask = torch.norm(grads, dim=-1) >= adjusted_grad_threshold
         
         selected_pts_mask = torch.logical_and(selected_pts_mask,
