@@ -227,42 +227,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # def check_z_scale_fixed(gaussians, expected_value=0.01, atol=1e-6):
-        #     """Check if all Gaussians have Z-scale fixed to expected value."""
-        #     z_scale = gaussians.get_scaling[:, 2]  # (N,)
-        #     if not torch.allclose(z_scale, torch.tensor(expected_value, device=z_scale.device), atol=atol):
-        #         bad_indices = (z_scale - expected_value).abs() > atol
-        #         print(f"Warning: {bad_indices.sum().item()} Gaussians have incorrect Z-scale.")
-        #         return False
-        #     return True
-
         loss.backward()
-        # with torch.no_grad():
-        #     if gaussians._scaling.grad is not None:
-        #         # Zero-out gradient of Z scaling (3rd component) for all Gaussians
-        #         gaussians._scaling.grad[:, 2] = 0
-
-        #     # Detach z-component so gradients won't flow into it
-        #     gaussians._scaling.register_hook(lambda grad: torch.cat([grad[:, 0:2], torch.zeros_like(grad[:, 2:3])], dim=1))
-            
-        #     # Force Z-scale value to a fixed constant (e.g., log(0.01) for exp-scaling)
-        #     fixed_value = torch.log(torch.tensor(0.01, device=gaussians._scaling.device))  # because scaling uses exp
-        #     gaussians._scaling[:, 2] = fixed_value
-
-        # if iteration % 100 == 0:
-        #     assert check_z_scale_fixed(gaussians), "Z-scale is not properly fixed!"
-
 
         iter_end.record()
-
-        if iteration % 100 == 0:
-            with torch.no_grad():
-                percentile = 75  # Or whatever makes sense for your scene
-                threshold = torch.quantile(gaussian_scores, percentile / 100.0)
-                low_score_mask = gaussian_scores < threshold
-
-                gaussians._features_rest[low_score_mask] = 0.0
-                gaussians._features_rest[low_score_mask].requires_grad = False
 
         with torch.no_grad():
             # Progress bar

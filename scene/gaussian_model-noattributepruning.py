@@ -468,16 +468,6 @@ class GaussianModel:
             stats = [torch.quantile(gaussian_scores, p).item() for p in [0.25, 0.5, 0.75, 0.85, 0.95, 1.0]]
             print(f"Gaussian Stats: 25th={stats[0]:.3f}, median={stats[1]:.3f}, 75th={stats[2]:.3f}, 85th={stats[3]:.3f}, 95th={stats[4]:.3f}, max={stats[5]:.3f}")
 
-        # # Freeze SH for low-contributing Gaussians
-        # with torch.no_grad():
-        #     percentile = 75  # Or whatever makes sense for your scene
-        #     threshold = torch.quantile(gaussian_scores, percentile / 100.0)
-        #     low_score_mask = gaussian_scores < threshold
-
-        #     self._features_rest[low_score_mask] = 0.0
-        #     self._features_rest[low_score_mask].requires_grad = False
-
-
         self.tmp_radii = radii
         self.densify_and_split(grads, max_grad, extent, gaussian_scores)
 
