@@ -10,6 +10,7 @@
 #
 
 import os
+import torch
 import random
 import json
 from utils.system_utils import searchForMaxIteration
@@ -86,16 +87,46 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
-    def save(self, iteration):
-        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        exposure_dict = {
-            image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
-            for image_name in self.gaussians.exposure_mapping
-        }
+    # def save(self, iteration):
+    #     point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+    #     self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+    #     exposure_dict = {
+    #         image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
+    #         for image_name in self.gaussians.exposure_mapping
+    #     }
 
-        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
-            json.dump(exposure_dict, f, indent=2)
+    #     with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
+    #         json.dump(exposure_dict, f, indent=2)
+
+    # NEW
+
+    def save_separate(self, iteration):
+        point_cloud_dir = os.path.join(self.model_path, f"point_cloud/iteration_{iteration}")
+        os.makedirs(point_cloud_dir, exist_ok=True)
+
+        # Group Gaussians by SH degree
+        unique_degrees = torch.unique(self.gaussians._sh_degree).tolist()
+        for degree in unique_degrees:
+            mask = self.gaussians._sh_degree == degree
+            if not torch.any(mask):
+                continue
+            path = os.path.join(point_cloud_dir, f"point_cloud_SH{degree}.ply")
+            self.gaussians.save_ply_separate(path, mask, degree)
+
+    def save(self, iteration, quantise=False, half_float=False):
+        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+        ply_name = "point_cloud"
+        if quantise:
+            ply_name += "_quantised"
+        if half_float:
+            ply_name += "_half"
+        ply_name_to_view = ply_name + ".ply"
+        ply_name += "_ours.ply"
+        self.gaussians.save_ply(os.path.join(point_cloud_path, ply_name), quantise, half_float)
+
+        self.gaussians.save_ply_to_view(os.path.join(point_cloud_path, ply_name_to_view), quantise, half_float)
+        self.save_separate(iteration)
+
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

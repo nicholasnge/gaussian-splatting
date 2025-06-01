@@ -66,6 +66,9 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+        # NEW
+        self._sh_degree = torch.empty(0)
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -133,6 +136,10 @@ class GaussianModel:
     @property
     def get_exposure(self):
         return self._exposure
+    
+    @property
+    def get_sh_degree(self):
+        return self._sh_degree
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
@@ -175,6 +182,9 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+        #NEW
+        self._sh_degree = torch.full((fused_point_cloud.shape[0],), self.max_sh_degree, dtype=torch.int32, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -223,38 +233,200 @@ class GaussianModel:
                 param_group['lr'] = lr
                 return lr
 
-    def construct_list_of_attributes(self):
+    def construct_list_of_attributes_separate(self, degree):
+        num_coeffs = (degree + 1)**2 - 1
+
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
-        for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
-            l.append('f_dc_{}'.format(i))
-        for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
-            l.append('f_rest_{}'.format(i))
+        for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+            l.append(f'f_dc_{i}')
+        for i in range(3 * num_coeffs):
+            l.append(f'f_rest_{i}')
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
-            l.append('scale_{}'.format(i))
+            l.append(f'scale_{i}')
         for i in range(self._rotation.shape[1]):
-            l.append('rot_{}'.format(i))
+            l.append(f'rot_{i}')
         return l
 
-    def save_ply(self, path):
+    def construct_list_of_attributes(self, rest_coeffs=45):
+        return ['x', 'y', 'z',
+                'f_dc_0','f_dc_1','f_dc_2',
+                *[f"f_rest_{i}" for i in range(rest_coeffs)],
+                'opacity',
+                'scale_0','scale_1','scale_2',
+                'rot_0','rot_1','rot_2','rot_3']
+    
+    def save_ply_separate(self, path, mask, degree):
+        print("degree: " + str(degree))
         mkdir_p(os.path.dirname(path))
-
-        xyz = self._xyz.detach().cpu().numpy()
+        
+        num_coeffs = (degree + 1)**2 - 1  # exclude DC term
+        
+        xyz = self._xyz[mask].detach().cpu().numpy()
+        f_dc = self._features_dc[mask].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        
+        # get relevant f rest only
+        f_rest = self._features_rest[mask].detach()
+        #f_rest = f_rest[:, :num_coeffs, :]            # (N, 3, num_coeffs)
+        f_rest = f_rest.transpose(1, 2).contiguous()        # (N, num_coeffs, 3)
+        f_rest = f_rest.flatten(start_dim=1).cpu().numpy()  # (N, num_coeffs * 3)
+        
+        opacities = self._opacity[mask].detach().cpu().numpy()
+        scale = self._scaling[mask].detach().cpu().numpy()
+        rotation = self._rotation[mask].detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
 
-        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes_separate(3)]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        
+        print("shape" + str(f_rest.shape))
+        expected_cols = len(dtype_full)
+        actual_cols = attributes.shape[1]
+        assert expected_cols == actual_cols, f"Expected {expected_cols} fields, got {actual_cols} columns in data."
+
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+        
+    def save_ply(self, path, quantised=False, half_float=False):
+        float_type = 'int16' if half_float else 'f4'
+        attribute_type = 'u1' if quantised else float_type
+        max_sh_coeffs = (self.max_sh_degree + 1) ** 2 - 1
+        mkdir_p(os.path.dirname(path))
+        elements_list = []
+
+        if quantised:
+            # Read codebook dict to extract ids and centers
+            if self._codebook_dict is None:
+                print("Clustering codebook missing. Returning without saving")
+                return
+
+            opacity = self._codebook_dict["opacity"].ids
+            scaling = self._codebook_dict["scaling"].ids
+            rot = torch.cat((self._codebook_dict["rotation_re"].ids,
+                            self._codebook_dict["rotation_im"].ids),
+                            dim=1)
+            features_dc = self._codebook_dict["features_dc"].ids
+            features_rest = torch.stack([self._codebook_dict[f"features_rest_{i}"].ids
+                                        for i in range(max_sh_coeffs)
+                                        ], dim=1).squeeze()
+
+            dtype_full = [(k, float_type) for k in self._codebook_dict.keys()]
+            codebooks = np.empty(256, dtype=dtype_full)
+
+            centers_numpy_list = [v.centers.detach().cpu().numpy() for v in self._codebook_dict.values()]
+
+            if half_float:
+                # No float 16 for plydata, so we just pointer cast everything to int16
+                for i in range(len(centers_numpy_list)):
+                    centers_numpy_list[i] = np.cast[np.float16](centers_numpy_list[i]).view(dtype=np.int16)
+                
+            codebooks[:] = list(map(tuple, np.concatenate([ar for ar in centers_numpy_list], axis=1)))
+        else:
+            opacity = self._opacity
+            scaling = self._scaling
+            rot = self._rotation
+            features_dc = self._features_dc
+            features_rest = self._features_rest
+
+        for sh_degree in range(self.max_sh_degree + 1):
+            coeffs_num = (sh_degree+1)**2 - 1
+            degrees_mask = (self._sh_degree == sh_degree).squeeze()
+
+            #  Position is not quantised
+            if half_float:
+                xyz = self._xyz[degrees_mask].detach().cpu().half().view(dtype=torch.int16).numpy()
+            else:
+                xyz = self._xyz[degrees_mask].detach().cpu().numpy()
+
+            f_dc = features_dc[degrees_mask].detach().contiguous().cpu().view(-1,3).numpy()
+            # Transpose so that to save rest featrues as rrr ggg bbb instead of rgb rgb rgb
+            f_rest = features_rest[degrees_mask][:, :coeffs_num].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            opacities = opacity[degrees_mask].detach().cpu().numpy()
+            scale = scaling[degrees_mask].detach().cpu().numpy()
+            rotation = rot[degrees_mask].detach().cpu().numpy()
+
+            dtype_full = [(attribute, float_type) 
+                          if attribute in ['x', 'y', 'z'] else (attribute, attribute_type) 
+                          for attribute in self.construct_list_of_attributes(coeffs_num * 3)]
+            elements = np.empty(degrees_mask.sum(), dtype=dtype_full)
+
+            attributes = np.concatenate((xyz, f_dc, f_rest, opacities, scale, rotation), axis=1)
+            elements[:] = list(map(tuple, attributes))
+            elements_list.append(PlyElement.describe(elements, f'vertex_{sh_degree}'))
+        if quantised:
+            elements_list.append(PlyElement.describe(codebooks, f'codebook_centers'))
+        PlyData(elements_list).write(path)
+
+    def save_ply_to_view(self, path, quantised=False, half_float=False):
+        float_type = 'int16' if half_float else 'f4'
+        attribute_type = 'u1' if quantised else float_type
+        max_sh_coeffs = (self.max_sh_degree + 1) ** 2 - 1
+        mkdir_p(os.path.dirname(path))
+        elements_list = []
+
+        if quantised:
+            # Read codebook dict to extract ids and centers
+            if self._codebook_dict is None:
+                print("Clustering codebook missing. Returning without saving")
+                return
+
+            opacity = self._codebook_dict["opacity"].ids
+            scaling = self._codebook_dict["scaling"].ids
+            rot = torch.cat((self._codebook_dict["rotation_re"].ids,
+                            self._codebook_dict["rotation_im"].ids),
+                            dim=1)
+            features_dc = self._codebook_dict["features_dc"].ids
+            features_rest = torch.stack([self._codebook_dict[f"features_rest_{i}"].ids
+                                        for i in range(max_sh_coeffs)
+                                        ], dim=1).squeeze()
+
+            dtype_full = [(k, float_type) for k in self._codebook_dict.keys()]
+            codebooks = np.empty(256, dtype=dtype_full)
+
+            centers_numpy_list = [v.centers.detach().cpu().numpy() for v in self._codebook_dict.values()]
+
+            if half_float:
+                # No float 16 for plydata, so we just pointer cast everything to int16
+                for i in range(len(centers_numpy_list)):
+                    centers_numpy_list[i] = np.cast[np.float16](centers_numpy_list[i]).view(dtype=np.int16)
+                
+            codebooks[:] = list(map(tuple, np.concatenate([ar for ar in centers_numpy_list], axis=1)))
+        else:
+            opacity = self._opacity
+            scaling = self._scaling
+            rot = self._rotation
+            features_dc = self._features_dc
+            features_rest = self._features_rest
+
+        coeffs_num = (self.max_sh_degree+1)**2 - 1
+
+        #  Position is not quantised
+        if half_float:
+            xyz = self._xyz.detach().cpu().half().view(dtype=torch.int16).numpy()
+        else:
+            xyz = self._xyz.detach().cpu().numpy()
+        
+        normals = np.zeros_like(xyz)
+        f_dc = features_dc.detach().contiguous().cpu().view(-1,3).numpy()
+        # Transpose so that to save rest featrues as rrr ggg bbb instead of rgb rgb rgb
+        f_rest = features_rest[:, :coeffs_num].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = opacity.detach().cpu().numpy()
+        scale = scaling.detach().cpu().numpy()
+        rotation = rot.detach().cpu().numpy()
+
+        dtype_full = [(attribute, float_type) 
+                        if attribute in ['x', 'y', 'z'] else (attribute, attribute_type) 
+                        for attribute in self.construct_list_of_attributes_separate(3)]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        elements_list.append(PlyElement.describe(elements, 'vertex'))
+
+        PlyData(elements_list).write(path)
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -314,6 +486,9 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+        #NEW
+        self._sh_degree = torch.full((xyz.shape[0],), self.max_sh_degree, dtype=torch.int32, device="cuda")
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -363,6 +538,9 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
+        
+        #NEW
+        self._sh_degree = self._sh_degree[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -386,7 +564,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_sh_degree):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -406,6 +584,9 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        #NEW
+        self._sh_degree = torch.cat((self._sh_degree, new_sh_degree))
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, gaussian_scores, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -432,12 +613,16 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        #NEW
+        new_sh_degree = self._sh_degree[selected_pts_mask].repeat_interleave(N)
 
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_sh_degree)
+
+        # this pruning is to remove the original gaussian that split
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, gaussian_scores, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, gaussian_scores):
         # Extract points that satisfy the gradient condition
         #selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
@@ -455,8 +640,10 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        #NEW
+        new_sh_degree = self._sh_degree[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_sh_degree)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, gaussian_scores):
         """Densification process with gradient thresholding and pruning."""
@@ -479,8 +666,10 @@ class GaussianModel:
 
 
         self.tmp_radii = radii
+        self.densify_and_clone(grads, max_grad, extent, gaussian_scores)
         self.densify_and_split(grads, max_grad, extent, gaussian_scores)
 
+        #this pruning is to remove not useful gaussians
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             prune_mask |= self.max_radii2D > max_screen_size

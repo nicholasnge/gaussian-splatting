@@ -28,6 +28,8 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import GaussianScoreTracker
+import faiss
+import numpy as np
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -46,65 +48,6 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
-
-def createTestMask(gt_image):
-    # Get image dimensions
-    height, width = gt_image.shape[1], gt_image.shape[2]
-    
-    # Define mask size (you can adjust these values)
-    mask_size = 0.4  # This means 40% of the image's width and height will have high weight
-    
-    # Calculate the region to focus on
-    start_height = int(height * (1 - mask_size) / 2)
-    end_height = int(height * (1 + mask_size) / 2)
-    start_width = int(width * (1 - mask_size) / 2)
-    end_width = int(width * (1 + mask_size) / 2)
-    
-    # Create a mask with low weight (0) everywhere
-    weight_mask = torch.zeros_like(gt_image, dtype=torch.float32, device=gt_image.device)
-    
-    # Set the middle region to high weight (1)
-    weight_mask[:, start_height:end_height, start_width:end_width] = 1.0
-    
-    return weight_mask
-    
-#     # Example 3: Apply a custom mask (e.g., from an image)
-#     # Assuming you have an external image (e.g., from a .png or .jpg file), you could read it and resize it
-#     # to match the shape of gt_image, then use it as the weight mask.
-#     # For instance:
-#     # from PIL import Image
-#     # mask_img = Image.open("path_to_mask_image.png").convert('L')
-#     # mask = torch.tensor(np.array(mask_img), dtype=torch.float32, device=gt_image.device)
-#     # mask = mask.unsqueeze(0).repeat(C, 1, 1)  # Repeat for each channel
-#     # return weight_mask
-
-
-# def getWeightMask(gt_image, image_name):
-#     #image_name = "DSC0" + image_name[4:]
-#     directory_mask = r".\360_v2\garden\images_mask"
-#     path_mask = os.path.abspath(os.path.join(directory_mask, image_name))
-#     weight_mask = cv2.imread(path_mask, cv2.IMREAD_GRAYSCALE)
-
-#     if weight_mask is None:
-#         raise ValueError(f"Failed to load weight mask from {image_name}")
-
-#     # Resize the weight mask to match the ground truth image size (assuming gt_image is a tensor)
-#     transform = transforms.Compose([
-#         transforms.ToPILImage(),  # Convert tensor to PIL image for resizing
-#         transforms.Resize((gt_image.shape[1], gt_image.shape[2])),  # Match height and width
-#         transforms.ToTensor(),  # Convert back to tensor
-#     ])
-    
-#     weight_mask = transform(weight_mask).float().to(gt_image.device)  # Ensure it's a float tensor
-#     #print(weight_mask)
-#         # Convert the tensor back to a NumPy array for visualization with OpenCV
-#     # weight_mask_cpu = weight_mask.squeeze(0).cpu().numpy()  # Remove channel dimension if it's 1
-#     # weight_mask_cpu = (weight_mask_cpu * 255).astype('uint8')  # Convert to 8-bit for display
-#     # cv2.imshow(f"Weight Mask: {image_name}", weight_mask_cpu)
-#     # cv2.waitKey(0)  # Wait for a key press to close the window
-#     # cv2.destroyAllWindows()  # Close the window
-
-#     return weight_mask
     
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -141,6 +84,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -167,6 +111,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
+
+        # if iteration == 500:
+        #     num_gaussians = gaussians._sh_degree.shape[0]
+        #     sh_levels = [0, 1, 2, 3]
+        #     sh_counts = [num_gaussians // 4] * 4
+        #     sh_counts[-1] += num_gaussians - sum(sh_counts)  # Adjust for any remainder
+
+        #     sh_degrees = torch.cat([
+        #         torch.full((count,), level, dtype=torch.int32, device="cuda")
+        #         for level, count in zip(sh_levels, sh_counts)
+        #     ])
+
+        #     # Shuffle to randomize their positions
+        #     indices = torch.randperm(num_gaussians, device="cuda")
+        #     gaussians._sh_degree = sh_degrees[indices]
 
         # Pick a random Camera
         if not viewpoint_stack:
@@ -227,42 +186,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # def check_z_scale_fixed(gaussians, expected_value=0.01, atol=1e-6):
-        #     """Check if all Gaussians have Z-scale fixed to expected value."""
-        #     z_scale = gaussians.get_scaling[:, 2]  # (N,)
-        #     if not torch.allclose(z_scale, torch.tensor(expected_value, device=z_scale.device), atol=atol):
-        #         bad_indices = (z_scale - expected_value).abs() > atol
-        #         print(f"Warning: {bad_indices.sum().item()} Gaussians have incorrect Z-scale.")
-        #         return False
-        #     return True
-
         loss.backward()
-        # with torch.no_grad():
-        #     if gaussians._scaling.grad is not None:
-        #         # Zero-out gradient of Z scaling (3rd component) for all Gaussians
-        #         gaussians._scaling.grad[:, 2] = 0
-
-        #     # Detach z-component so gradients won't flow into it
-        #     gaussians._scaling.register_hook(lambda grad: torch.cat([grad[:, 0:2], torch.zeros_like(grad[:, 2:3])], dim=1))
-            
-        #     # Force Z-scale value to a fixed constant (e.g., log(0.01) for exp-scaling)
-        #     fixed_value = torch.log(torch.tensor(0.01, device=gaussians._scaling.device))  # because scaling uses exp
-        #     gaussians._scaling[:, 2] = fixed_value
-
-        # if iteration % 100 == 0:
-        #     assert check_z_scale_fixed(gaussians), "Z-scale is not properly fixed!"
 
 
         iter_end.record()
-
-        if iteration % 100 == 0:
-            with torch.no_grad():
-                percentile = 75  # Or whatever makes sense for your scene
-                threshold = torch.quantile(gaussian_scores, percentile / 100.0)
-                low_score_mask = gaussian_scores < threshold
-
-                gaussians._features_rest[low_score_mask] = 0.0
-                gaussians._features_rest[low_score_mask].requires_grad = False
 
         with torch.no_grad():
             # Progress bar
@@ -282,6 +209,73 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+            # assign SH degrees now
+            if iteration == opt.densify_from_iter:
+                print("assigning SH degrees")
+                gaussian_scores = gaussianScoreTracker.get_scores()
+
+                # 1. Initial assignment
+                initial_degrees = torch.zeros_like(gaussian_scores, dtype=torch.int32)
+                # initial_degrees[gaussian_scores > 5.0] = 3
+                # initial_degrees[gaussian_scores <= 5.0] = 0
+                f_rest = gaussians._features_rest
+                def num_sh_coeffs(deg): return (deg + 1)**2
+
+                print(f"initial degrees shape: {initial_degrees.shape}")
+                print(f"sh degrees shape: {gaussians._sh_degree.shape}")
+
+                xyz_all = gaussians.get_xyz.detach().cpu().numpy().astype('float32')
+                degrees = initial_degrees.cpu()
+                
+
+                # expand SH degree 3 first
+                radius = 0.1 * scene.cameras_extent
+                src_mask = (degrees == 3)
+                tgt_mask = (degrees < 3)
+                src_xyz = xyz_all[src_mask]
+                tgt_xyz = xyz_all[tgt_mask]
+                tgt_indices = np.where(tgt_mask.numpy())[0]
+                index = faiss.IndexFlatL2(3)
+                index.add(tgt_xyz)
+                LIMS, D, I = index.range_search(src_xyz, radius**2)
+                global_ids = tgt_indices[I.astype(np.int64)]
+                unique_ids = np.unique(global_ids)
+                degrees[unique_ids] = 3
+
+                radius = 0.3 * scene.cameras_extent
+
+                for source_deg in [3, 2]:
+                    target_deg = source_deg - 1
+                    src_mask = (degrees == source_deg)
+                    tgt_mask = (degrees < target_deg)
+
+                    src_xyz = xyz_all[src_mask]
+                    tgt_xyz = xyz_all[tgt_mask]
+                    if len(src_xyz) == 0 or len(tgt_xyz) == 0:
+                        continue
+
+                    tgt_indices = np.where(tgt_mask.numpy())[0]
+                    index = faiss.IndexFlatL2(3)
+                    index.add(tgt_xyz)
+                    LIMS, D, I = index.range_search(src_xyz, radius**2)
+                    print(I)
+                    global_ids = tgt_indices[I.astype(np.int64)]
+                    print(f"global ids: {global_ids}")
+                    unique_ids = np.unique(global_ids)
+                    degrees[unique_ids] = target_deg
+                    print(f"src_xyz {len(src_xyz)}")
+                    print(f"tgt_xyz {len(tgt_xyz)}")
+                    print(f"assigned {len(unique_ids)}")
+                # 3. Zero unused SH coeffs
+                for deg in range(gaussians.max_sh_degree + 1):
+                    cutoff = num_sh_coeffs(deg) - 1
+                    mask = degrees == deg
+                    f_rest[mask, cutoff:, :] = 0.0
+
+                gaussians._sh_degree = degrees.cuda()
+                gaussians._features_rest = f_rest
+                print("SH degrees assigned")
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -313,6 +307,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    with torch.no_grad():
+        # _features_rest: (N, F, SH-1)
+        sh_rest = gaussians._features_rest  # shape: (N, 3, num_SH-1)
+
+        # Check which Gaussians have *all* SH>0 coefficients = 0
+        zeroed_mask = (sh_rest == 0).all(dim=1).all(dim=1)  # shape: (N,)
+
+        count = zeroed_mask.sum().item()
+        total = sh_rest.shape[0]
+
+        print(f"\n[Training Complete] {count}/{total} Gaussians have SH>0 features zeroed out (degree 0 only).")
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -355,7 +361,6 @@ def training_report(tb_writer, iteration, LNew, total_loss, new_loss, elapsed, t
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    weight_mask = createTestMask(gt_image) #TODO
 
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
