@@ -112,21 +112,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # if iteration == 500:
-        #     num_gaussians = gaussians._sh_degree.shape[0]
-        #     sh_levels = [0, 1, 2, 3]
-        #     sh_counts = [num_gaussians // 4] * 4
-        #     sh_counts[-1] += num_gaussians - sum(sh_counts)  # Adjust for any remainder
-
-        #     sh_degrees = torch.cat([
-        #         torch.full((count,), level, dtype=torch.int32, device="cuda")
-        #         for level, count in zip(sh_levels, sh_counts)
-        #     ])
-
-        #     # Shuffle to randomize their positions
-        #     indices = torch.randperm(num_gaussians, device="cuda")
-        #     gaussians._sh_degree = sh_degrees[indices]
-
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -206,10 +191,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Replace Ll1 & l1_loss function with new respective ones
             #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             training_report(tb_writer, iteration, LNew, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-
             # assign SH degrees now
             if iteration == opt.densify_from_iter:
                 print("assigning SH degrees")
@@ -217,8 +198,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # 1. Initial assignment
                 initial_degrees = torch.zeros_like(gaussian_scores, dtype=torch.int32)
-                # initial_degrees[gaussian_scores > 5.0] = 3
-                # initial_degrees[gaussian_scores <= 5.0] = 0
+                initial_degrees[gaussian_scores > 5.0] = 3
+                initial_degrees[gaussian_scores <= 5.0] = 0
                 f_rest = gaussians._features_rest
                 def num_sh_coeffs(deg): return (deg + 1)**2
 
@@ -307,6 +288,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
     with torch.no_grad():
         # _features_rest: (N, F, SH-1)
         sh_rest = gaussians._features_rest  # shape: (N, 3, num_SH-1)
@@ -318,6 +300,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total = sh_rest.shape[0]
 
         print(f"\n[Training Complete] {count}/{total} Gaussians have SH>0 features zeroed out (degree 0 only).")
+
+    scene.save(iteration)
+    scene.gaussians.produce_clusters(store_dict_path=scene.model_path)
+    scene.save_separate(iteration)        
+    scene.save(iteration, quantise=True)
+    scene.save(iteration, quantise=True, half_float=True)
 
 
 def prepare_output_and_logger(args):    

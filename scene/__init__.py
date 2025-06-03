@@ -125,8 +125,6 @@ class Scene:
         self.gaussians.save_ply(os.path.join(point_cloud_path, ply_name), quantise, half_float)
 
         self.gaussians.save_ply_to_view(os.path.join(point_cloud_path, ply_name_to_view), quantise, half_float)
-        #self.save_separate(iteration)
-
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

@@ -20,13 +20,34 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.general_utils import strip_symmetric, build_scaling_rotation, pcast_i16_to_f32
 from GaussianScoreScaler import GaussianScoreScaler
+from collections import OrderedDict
+from diff_gaussian_rasterization._C import kmeans_cuda
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
     pass
+
+class Codebook():
+    def __init__(self, ids, centers):
+        self.ids = ids
+        self.centers = centers
+    
+    def evaluate(self):
+        return self.centers[self.ids.flatten().long()]
+
+def generate_codebook(values, inverse_activation_fn=lambda x: x, num_clusters=256, tol=0.0001):
+    shape = values.shape
+    values = values.flatten().view(-1, 1)
+    centers = values[torch.randint(values.shape[0], (num_clusters, 1), device="cuda").squeeze()].view(-1,1)
+
+    ids, centers = kmeans_cuda(values, centers.squeeze(), tol, 500)
+    ids = ids.byte().squeeze().view(shape)
+    centers = centers.view(-1,1)
+
+    return Codebook(ids.cuda(), inverse_activation_fn(centers.cuda()))
 
 class GaussianModel:
 
@@ -433,61 +454,222 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path, use_train_test_exp = False):
+    # def load_ply(self, path, use_train_test_exp = False):
+    #     plydata = PlyData.read(path)
+    #     if use_train_test_exp:
+    #         exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
+    #         if os.path.exists(exposure_file):
+    #             with open(exposure_file, "r") as f:
+    #                 exposures = json.load(f)
+    #             self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
+    #             print(f"Pretrained exposures loaded.")
+    #         else:
+    #             print(f"No exposure to be loaded at {exposure_file}")
+    #             self.pretrained_exposures = None
+
+    #     xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
+    #                     np.asarray(plydata.elements[0]["y"]),
+    #                     np.asarray(plydata.elements[0]["z"])),  axis=1)
+    #     opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+
+    #     features_dc = np.zeros((xyz.shape[0], 3, 1))
+    #     features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
+    #     features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
+    #     features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+
+    #     extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+    #     extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
+    #     assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
+    #     features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+    #     for idx, attr_name in enumerate(extra_f_names):
+    #         features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    #     # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+    #     features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+
+    #     scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+    #     scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
+    #     scales = np.zeros((xyz.shape[0], len(scale_names)))
+    #     for idx, attr_name in enumerate(scale_names):
+    #         scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+    #     rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+    #     rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
+    #     rots = np.zeros((xyz.shape[0], len(rot_names)))
+    #     for idx, attr_name in enumerate(rot_names):
+    #         rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+    #     self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+    #     self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+    #     self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+    #     self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+    #     self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
+    #     self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+    #     self.active_sh_degree = self.max_sh_degree
+
+    #     #NEW
+    #     self._sh_degree = torch.full((xyz.shape[0],), self.max_sh_degree, dtype=torch.int32, device="cuda")
+
+    def _parse_vertex_group(self,
+                            vertex_group,
+                            sh_degree,
+                            float_type,
+                            attribute_type,
+                            max_coeffs_num,
+                            quantised,
+                            half_precision,                            
+                            codebook_centers_torch=None):
+        coeffs_num = (sh_degree+1)**2 - 1
+        num_primitives = vertex_group.count
+
+        xyz = np.stack((np.asarray(vertex_group["x"], dtype=float_type),
+                        np.asarray(vertex_group["y"], dtype=float_type),
+                        np.asarray(vertex_group["z"], dtype=float_type)), axis=1)
+
+        opacity = np.asarray(vertex_group["opacity"], dtype=attribute_type)[..., np.newaxis]
+    
+        # Stacks the separate components of a vector attribute into a joint numpy array
+        # Defined just to avoid visual clutter
+        def stack_vector_attribute(name, count):
+            return np.stack([np.asarray(vertex_group[f"{name}_{i}"], dtype=attribute_type)
+                            for i in range(count)], axis=1)
+
+        features_dc = stack_vector_attribute("f_dc", 3).reshape(-1, 1, 3)
+        scaling = stack_vector_attribute("scale", 3)
+        rotation = stack_vector_attribute("rot", 4)
+        
+        # Take care of error when trying to stack 0 arrays
+        if sh_degree > 0:
+            features_rest = stack_vector_attribute("f_rest", coeffs_num*3).reshape((num_primitives, 3, coeffs_num))
+        else:
+            features_rest = np.empty((num_primitives, 3, 0), dtype=attribute_type)
+
+        # if not self.variable_sh_bands:
+            # Using full tensors (P x 15) even for points that don't require it
+        features_rest = np.concatenate(
+            (features_rest,
+                np.zeros((num_primitives, 3, max_coeffs_num - coeffs_num), dtype=attribute_type)), axis=2)
+
+        degrees = np.ones(num_primitives, dtype=np.int32)[..., np.newaxis] * sh_degree
+
+        xyz = torch.from_numpy(xyz).cuda()
+        if half_precision:
+            xyz = pcast_i16_to_f32(xyz)
+        features_dc = torch.from_numpy(features_dc).contiguous().cuda()
+        features_rest = torch.from_numpy(features_rest).contiguous().cuda()
+        opacity = torch.from_numpy(opacity).cuda()
+        scaling = torch.from_numpy(scaling).cuda()
+        rotation = torch.from_numpy(rotation).cuda()
+        degrees = torch.from_numpy(degrees).cuda()
+
+        # If quantisation has been used, it is needed to index the centers
+        if quantised:
+            features_dc = codebook_centers_torch['features_dc'][features_dc.view(-1).long()].view(-1, 1, 3)
+
+            # This is needed as we might have padded the features_rest tensor with zeros before
+            reshape_channels = max_coeffs_num            
+            # The gather operation indexes a 256x15 tensor with a (P*3)features_rest index tensor,
+            # in a column-wise fashion
+            # Basically this is equivalent to indexing a single codebook with a P*3 index
+            # features_rest times inside a loop
+            features_rest = codebook_centers_torch['features_rest'].gather(0, features_rest.view(num_primitives*3, reshape_channels).long()).view(num_primitives, 3, reshape_channels)
+            opacity = codebook_centers_torch['opacity'][opacity.long()]
+            scaling = codebook_centers_torch['scaling'][scaling.view(num_primitives*3).long()].view(num_primitives, 3)
+            # Index the real and imaginary part separately
+            rotation = torch.cat((
+                codebook_centers_torch['rotation_re'][rotation[:, 0:1].long()],
+                codebook_centers_torch['rotation_im'][rotation[:, 1:].reshape(num_primitives*3).long()].view(num_primitives,3)
+                ), dim=1)
+
+        return {'xyz': xyz,
+                'opacity': opacity,
+                'features_dc': features_dc,
+                'features_rest': features_rest,
+                'scaling': scaling,
+                'rotation': rotation,
+                'degrees': degrees
+        }
+    
+    def load_ply(self, path, half_float=False, quantised=False):
         plydata = PlyData.read(path)
-        if use_train_test_exp:
-            exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
-            if os.path.exists(exposure_file):
-                with open(exposure_file, "r") as f:
-                    exposures = json.load(f)
-                self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
-                print(f"Pretrained exposures loaded.")
-            else:
-                print(f"No exposure to be loaded at {exposure_file}")
-                self.pretrained_exposures = None
 
-        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
-                        np.asarray(plydata.elements[0]["y"]),
-                        np.asarray(plydata.elements[0]["z"])),  axis=1)
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        xyz_list = []
+        features_dc_list = []
+        features_rest_list = []
+        opacity_list = []
+        scaling_list = []
+        rotation_list = []
+        degrees_list = []
 
-        features_dc = np.zeros((xyz.shape[0], 3, 1))
-        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+        float_type = 'int16' if half_float else 'f4'
+        attribute_type = 'u1' if quantised else float_type
+        max_coeffs_num = (self.max_sh_degree+1)**2 - 1
 
-        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
-        extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+        codebook_centers_torch = None
+        if quantised:
+            # Parse the codebooks.
+            # The layout is 256 x 20, where 256 is the number of centers and 20 number of codebooks
+            # In the future we could have different number of centers
+            codebook_centers = plydata.elements[-1]
 
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
-        scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
-        scales = np.zeros((xyz.shape[0], len(scale_names)))
-        for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            codebook_centers_torch = OrderedDict()
+            codebook_centers_torch['features_dc'] = torch.from_numpy(np.asarray(codebook_centers['features_dc'], dtype=float_type)).cuda()
+            codebook_centers_torch['features_rest'] = torch.from_numpy(np.concatenate(
+                [
+                    np.asarray(codebook_centers[f'features_rest_{i}'], dtype=float_type)[..., np.newaxis]
+                    for i in range(max_coeffs_num)
+                ], axis=1)).cuda()
+            codebook_centers_torch['opacity'] = torch.from_numpy(np.asarray(codebook_centers['opacity'], dtype=float_type)).cuda()
+            codebook_centers_torch['scaling'] = torch.from_numpy(np.asarray(codebook_centers['scaling'], dtype=float_type)).cuda()
+            codebook_centers_torch['rotation_re'] = torch.from_numpy(np.asarray(codebook_centers['rotation_re'], dtype=float_type)).cuda()
+            codebook_centers_torch['rotation_im'] = torch.from_numpy(np.asarray(codebook_centers['rotation_im'], dtype=float_type)).cuda()
 
-        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
-        rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
-        rots = np.zeros((xyz.shape[0], len(rot_names)))
-        for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            # If use half precision then we have to pointer cast the int16 to float16
+            # and then cast them to floats, as that's the format that our renderer accepts
+            if half_float:
+                for k, v in codebook_centers_torch.items():
+                    codebook_centers_torch[k] = pcast_i16_to_f32(v)
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        # Iterate over the point clouds that are stored on top level of plyfile
+        # to get the various fields values 
+        for sh_degree in range(0, self.max_sh_degree+1):
+            attribues_dict = self._parse_vertex_group(plydata.elements[sh_degree],
+                                                      sh_degree,
+                                                      float_type,
+                                                      attribute_type,
+                                                      max_coeffs_num,
+                                                      quantised,
+                                                      half_float,
+                                                      codebook_centers_torch)
 
+            xyz_list.append(attribues_dict['xyz'])
+            features_dc_list.append(attribues_dict['features_dc'])
+            features_rest_list.append(attribues_dict['features_rest'].transpose(1,2))
+            opacity_list.append(attribues_dict['opacity'])
+            scaling_list.append(attribues_dict['scaling'])
+            rotation_list.append(attribues_dict['rotation'])
+            degrees_list.append(attribues_dict['degrees'])
+
+        # Concatenate the tensors into one, to be used in our program
+        # TODO: allow multiple PCDs to be rendered/optimise and skip this step
+        xyz = torch.cat((xyz_list), dim=0)
+        features_dc = torch.cat((features_dc_list), dim=0)
+        features_rest = torch.cat((features_rest_list), dim=0)
+
+        opacity = torch.cat((opacity_list), dim=0)
+        scaling = torch.cat((scaling_list), dim=0)
+        rotation = torch.cat((rotation_list), dim=0)
+        
+        self._xyz = nn.Parameter(xyz.requires_grad_(True))
+        self._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+        self._opacity = nn.Parameter(opacity.requires_grad_(True))
+        self._scaling = nn.Parameter(scaling.requires_grad_(True))
+        self._rotation = nn.Parameter(rotation.requires_grad_(True))
+        degrees = torch.cat((degrees_list), dim=0).squeeze(-1).to(dtype=torch.int32)
+        self._sh_degree = degrees  # shape (N,)
+        
         self.active_sh_degree = self.max_sh_degree
-
-        #NEW
-        self._sh_degree = torch.full((xyz.shape[0],), self.max_sh_degree, dtype=torch.int32, device="cuda")
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -655,16 +837,6 @@ class GaussianModel:
             stats = [torch.quantile(gaussian_scores, p).item() for p in [0.25, 0.5, 0.75, 0.85, 0.95, 1.0]]
             print(f"Gaussian Stats: 25th={stats[0]:.3f}, median={stats[1]:.3f}, 75th={stats[2]:.3f}, 85th={stats[3]:.3f}, 95th={stats[4]:.3f}, max={stats[5]:.3f}")
 
-        # # Freeze SH for low-contributing Gaussians
-        # with torch.no_grad():
-        #     percentile = 75  # Or whatever makes sense for your scene
-        #     threshold = torch.quantile(gaussian_scores, percentile / 100.0)
-        #     low_score_mask = gaussian_scores < threshold
-
-        #     self._features_rest[low_score_mask] = 0.0
-        #     self._features_rest[low_score_mask].requires_grad = False
-
-
         self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent, gaussian_scores)
         self.densify_and_split(grads, max_grad, extent, gaussian_scores)
@@ -681,3 +853,26 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def produce_clusters(self, num_clusters=256, store_dict_path=None):
+        max_coeffs_num = (self.max_sh_degree + 1)**2 - 1
+        codebook_dict = OrderedDict({})
+
+        codebook_dict["features_dc"] = generate_codebook(self._features_dc.detach()[:, 0],
+                                                         num_clusters=num_clusters, tol=0.001)
+        for sh_degree in range(max_coeffs_num):
+                codebook_dict[f"features_rest_{sh_degree}"] = generate_codebook(
+                    self._features_rest.detach()[:, sh_degree], num_clusters=num_clusters)
+
+        codebook_dict["opacity"] = generate_codebook(self.get_opacity.detach(),
+                                                     self.inverse_opacity_activation, num_clusters=num_clusters)
+        codebook_dict["scaling"] = generate_codebook(self.get_scaling.detach(),
+                                                     self.scaling_inverse_activation, num_clusters=num_clusters)
+        codebook_dict["rotation_re"] = generate_codebook(self.get_rotation.detach()[:, 0:1],
+                                                         num_clusters=num_clusters)
+        codebook_dict["rotation_im"] = generate_codebook(self.get_rotation.detach()[:, 1:],
+                                                         num_clusters=num_clusters)
+        if store_dict_path is not None:
+            torch.save(codebook_dict, os.path.join(store_dict_path, 'codebook.pt'))
+        
+        self._codebook_dict = codebook_dict

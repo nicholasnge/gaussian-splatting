@@ -23,13 +23,14 @@ from argparse import ArgumentParser
 import matplotlib.pyplot as plt
 
 
-def readImages(renders_dir, gt_dir):
+def readImages(renders_dir, gt_dir, mask_dir):
     renders = []
     gts = []
     masks = []
     image_names = []
 
-    mask_dir = Path(str(gt_dir) + "M")  # Mask directory (same as GT but with 'M')
+    if mask_dir == None:
+        mask_dir = Path(str(gt_dir) + "M")  # Mask directory (same as GT but with 'M')
 
     for fname in os.listdir(renders_dir):
         render = Image.open(renders_dir / fname)
@@ -86,9 +87,10 @@ def evaluate(model_paths):
         per_view_dict_polytopeonly[scene_dir] = {}
 
         test_dir = Path(scene_dir) / "test"
+        mask_dir = Path(test_dir) / "masks" 
 
         for method in os.listdir(test_dir):
-            if method != "ours_30000":
+            if method == "masks":
                 continue
             print("Method:", method)
 
@@ -100,7 +102,7 @@ def evaluate(model_paths):
             method_dir = test_dir / method
             gt_dir = method_dir/ "gt"
             renders_dir = method_dir / "renders"
-            renders, gts, masks, image_names = readImages(renders_dir, gt_dir)
+            renders, gts, masks, image_names = readImages(renders_dir, gt_dir, mask_dir)
 
             maskedssims = []
             nonmaskedssims = []
