@@ -18,7 +18,7 @@ class GaussianScoreTracker:
         """
         with torch.no_grad():
             new_scores = new_scores.detach()  # Detach incoming scores
-            new_scores = torch.clamp(new_scores, max=500)
+            #new_scores = torch.clamp(new_scores, max=500)
             num_gaussians = new_scores.shape[0]
 
             if self.running_sum is None or num_gaussians != self.gaussian_count:
