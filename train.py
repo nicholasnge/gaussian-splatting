@@ -69,7 +69,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # initialise weight mask
     weight_mask = None
     # initialise score tracker
-    gaussianScoreTracker = GaussianScoreTracker.GaussianScoreTracker(ema_alpha=0.1)
+    gaussianScoreTracker = GaussianScoreTracker.GaussianScoreTracker()
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -192,25 +192,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             training_report(tb_writer, iteration, LNew, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             # assign SH degrees now
-            if iteration == opt.densify_from_iter:
-                print("assigning SH degrees")
+            if iteration == 2000:
                 gaussian_scores = gaussianScoreTracker.get_scores()
 
                 # 1. Initial assignment
                 initial_degrees = torch.zeros_like(gaussian_scores, dtype=torch.int32)
-                initial_degrees[gaussian_scores > 5.0] = 3
-                initial_degrees[gaussian_scores <= 5.0] = 0
+                initial_degrees[gaussian_scores > 50.0] = 3
+                initial_degrees[gaussian_scores <= 50.0] = 0
                 f_rest = gaussians._features_rest
                 def num_sh_coeffs(deg): return (deg + 1)**2
-
-                print(f"initial degrees shape: {initial_degrees.shape}")
-                print(f"sh degrees shape: {gaussians._sh_degree.shape}")
 
                 xyz_all = gaussians.get_xyz.detach().cpu().numpy().astype('float32')
                 degrees = initial_degrees.cpu()
                 
+                # # Filter out floaters from initial degree-3 set
+                # print("eliminating floaters")
+                # floater_radius = 0.1 * scene.cameras_extent
+                # deg3_mask = (degrees == 3)
+                # deg3_xyz = xyz_all[deg3_mask]
+                # deg3_indices = np.where(deg3_mask.numpy())[0]
+                # index = faiss.IndexFlatL2(3)
+                # index.add(deg3_xyz)
+                # LIMS, _, _ = index.range_search(deg3_xyz, floater_radius**2)
+                # neighbor_counts = np.diff(LIMS)
+                # floaters = np.where(neighbor_counts < 10)[0]
+                # global_floater_ids = deg3_indices[floaters]
+                # degrees[global_floater_ids] = 0
+
+                # total_deg3 = deg3_mask.sum().item()
+                # num_eliminated = len(global_floater_ids)
+                # print(f"[SH Degree Prune] Eliminated {num_eliminated}/{total_deg3} floaters from initial degree-3 set.")
+
 
                 # expand SH degree 3 first
+                print("expanding degree 3")
                 radius = 0.1 * scene.cameras_extent
                 src_mask = (degrees == 3)
                 tgt_mask = (degrees < 3)
@@ -227,6 +242,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 radius = 0.3 * scene.cameras_extent
 
                 for source_deg in [3, 2]:
+                    print("spreading degree")
                     target_deg = source_deg - 1
                     src_mask = (degrees == source_deg)
                     tgt_mask = (degrees < target_deg)
@@ -240,14 +256,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     index = faiss.IndexFlatL2(3)
                     index.add(tgt_xyz)
                     LIMS, D, I = index.range_search(src_xyz, radius**2)
-                    print(I)
                     global_ids = tgt_indices[I.astype(np.int64)]
-                    print(f"global ids: {global_ids}")
                     unique_ids = np.unique(global_ids)
                     degrees[unique_ids] = target_deg
-                    print(f"src_xyz {len(src_xyz)}")
-                    print(f"tgt_xyz {len(tgt_xyz)}")
-                    print(f"assigned {len(unique_ids)}")
                 # 3. Zero unused SH coeffs
                 for deg in range(gaussians.max_sh_degree + 1):
                     cutoff = num_sh_coeffs(deg) - 1
@@ -256,7 +267,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 gaussians._sh_degree = degrees.cuda()
                 gaussians._features_rest = f_rest
-                print("SH degrees assigned")
 
             # Densification
             if iteration < opt.densify_until_iter:

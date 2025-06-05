@@ -1,55 +1,51 @@
 import torch
 
-
 class GaussianScoreTracker:
-    def __init__(self, ema_alpha=0.1):
+    def __init__(self):
         """
-        Tracks Gaussian scores over time using an Exponential Moving Average (EMA).
-
-        Args:
-            ema_alpha (float): Smoothing factor (higher = more responsive, lower = smoother).
+        Tracks Gaussian scores using a simple running average.
         """
-        self.ema_alpha = ema_alpha
-        self.gaussian_scores = None  # Moving average scores
-        self.gaussian_count = 0  # Track number of Gaussians
+        self.running_sum = None
+        self.count = 0
+        self.gaussian_count = 0
 
     def update(self, new_scores):
         """
-        Updates the moving average of Gaussian scores.
+        Updates the running average of Gaussian scores.
 
         Args:
             new_scores (torch.Tensor): Tensor of current frame's Gaussian scores.
         """
-        with torch.no_grad():  # Ensure no gradients are tracked
+        with torch.no_grad():
             new_scores = new_scores.detach()  # Detach incoming scores
+            new_scores = torch.clamp(new_scores, max=500)
             num_gaussians = new_scores.shape[0]
 
-            # If Gaussians count changes, reset tracker
-            if self.gaussian_scores is None or num_gaussians != self.gaussian_count:
+            if self.running_sum is None or num_gaussians != self.gaussian_count:
                 self.reset(num_gaussians)
 
-            # Apply EMA Update: new_average = (1 - alpha) * old_average + alpha * new_value
-            self.gaussian_scores = (1 - self.ema_alpha) * self.gaussian_scores + self.ema_alpha * new_scores
-            self.gaussian_scores.requires_grad_(False)  # Ensure no gradients
+            self.running_sum += new_scores
+            self.count += 1
 
     def reset(self, num_gaussians):
         """
-        Resets the Gaussian score tracker when Gaussian count changes.
+        Resets the tracker if the number of Gaussians changes.
 
         Args:
-            num_gaussians (int): The new number of Gaussians after densification.
+            num_gaussians (int): The new number of Gaussians.
         """
-        with torch.no_grad():
-            print("Resetting Gaussian Score Tracker")
-            self.gaussian_scores = torch.zeros(num_gaussians, device="cuda", dtype=torch.float32)
-            self.gaussian_scores.requires_grad_(False)  # Ensure it never tracks gradients
-            self.gaussian_count = num_gaussians
+        print("Resetting Gaussian Score Tracker")
+        self.running_sum = torch.zeros(num_gaussians, device="cuda", dtype=torch.float32)
+        self.count = 0
+        self.gaussian_count = num_gaussians
 
     def get_scores(self):
         """
-        Retrieves the current moving average of Gaussian scores.
+        Returns the current average scores.
 
         Returns:
-            torch.Tensor: Tensor of smoothed Gaussian scores.
+            torch.Tensor or None: Averaged Gaussian scores.
         """
-        return self.gaussian_scores if self.gaussian_scores is not None else None
+        if self.running_sum is None or self.count == 0:
+            return None
+        return self.running_sum / self.count

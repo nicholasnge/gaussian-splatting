@@ -27,7 +27,7 @@ WARNED = False
 def modify_path(file_path):
     dir_path, filename = os.path.split(file_path)  # Split into directory and filename
     parent_dir = os.path.dirname(dir_path)  # Get parent directory
-    new_dir = os.path.join(parent_dir, "images_M")  # Target directory
+    new_dir = os.path.join(parent_dir, "masks")  # Target directory
 
     # Change file extension from .JPG to .png
     base_name, _ = os.path.splitext(filename)  # Remove original extension

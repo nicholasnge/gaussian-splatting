@@ -112,6 +112,9 @@ class Scene:
                 continue
             path = os.path.join(point_cloud_dir, f"point_cloud_SH{degree}.ply")
             self.gaussians.save_ply_separate(path, mask, degree)
+        # mask = self.gaussians._sh_degree == 3
+        # path = os.path.join(point_cloud_dir, f"point_cloud.ply")
+        # self.gaussians.save_ply_separate(path, mask, 3)
 
     def save(self, iteration, quantise=False, half_float=False):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -124,7 +127,7 @@ class Scene:
         ply_name += "_ours.ply"
         self.gaussians.save_ply(os.path.join(point_cloud_path, ply_name), quantise, half_float)
 
-        self.gaussians.save_ply_to_view(os.path.join(point_cloud_path, ply_name_to_view), quantise, half_float)
+        #self.gaussians.save_ply_to_view(os.path.join(point_cloud_path, ply_name_to_view), quantise, half_float)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
