@@ -813,7 +813,8 @@ class GaussianModel:
         
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+        selected_pts_mask = torch.logical_and(selected_pts_mask, self._sh_degree == 3)
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -841,6 +842,17 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent, gaussian_scores)
         self.densify_and_split(grads, max_grad, extent, gaussian_scores)
 
+        #this pruning is to remove not useful gaussians
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            prune_mask |= self.max_radii2D > max_screen_size
+            prune_mask |= self.get_scaling.max(dim=1).values > 0.1 * extent
+        self.prune_points(prune_mask)
+
+        torch.cuda.empty_cache()
+
+    def prune_only(self, min_opacity, extent, max_screen_size):
+        """Densification process with gradient thresholding and pruning."""
         #this pruning is to remove not useful gaussians
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
