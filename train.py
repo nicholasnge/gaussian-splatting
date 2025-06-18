@@ -66,8 +66,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    # initialise weight mask
-    weight_mask = None
     # initialise score tracker
     gaussianScoreTracker = GaussianScoreTracker.GaussianScoreTracker()
 
@@ -197,8 +195,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # 1. Initial assignment
                 initial_degrees = torch.zeros_like(gaussian_scores, dtype=torch.int32)
-                initial_degrees[gaussian_scores > 50.0] = 3
-                initial_degrees[gaussian_scores <= 50.0] = 0
+                initial_degrees[gaussian_scores > 0.15] = 3
+                initial_degrees[gaussian_scores <= 0.15] = 0
                 f_rest = gaussians._features_rest
                 def num_sh_coeffs(deg): return (deg + 1)**2
 
@@ -226,7 +224,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # expand SH degree 3 first
                 print("expanding degree 3")
-                radius = 0.1 * scene.cameras_extent
+                radius = 0.05 * scene.cameras_extent
                 src_mask = (degrees == 3)
                 tgt_mask = (degrees < 3)
                 src_xyz = xyz_all[src_mask]
@@ -239,27 +237,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 unique_ids = np.unique(global_ids)
                 degrees[unique_ids] = 3
 
-                radius = 0.3 * scene.cameras_extent
+                # radius = 0.3 * scene.cameras_extent
 
-                for source_deg in [3, 2]:
-                    print("spreading degree")
-                    target_deg = source_deg - 1
-                    src_mask = (degrees == source_deg)
-                    tgt_mask = (degrees < target_deg)
+                # for source_deg in [3, 2]:
+                #     print("spreading degree")
+                #     target_deg = source_deg - 1
+                #     src_mask = (degrees == source_deg)
+                #     tgt_mask = (degrees < target_deg)
 
-                    src_xyz = xyz_all[src_mask]
-                    tgt_xyz = xyz_all[tgt_mask]
-                    if len(src_xyz) == 0 or len(tgt_xyz) == 0:
-                        continue
+                #     src_xyz = xyz_all[src_mask]
+                #     tgt_xyz = xyz_all[tgt_mask]
+                #     if len(src_xyz) == 0 or len(tgt_xyz) == 0:
+                #         continue
 
-                    tgt_indices = np.where(tgt_mask.numpy())[0]
-                    index = faiss.IndexFlatL2(3)
-                    index.add(tgt_xyz)
-                    LIMS, D, I = index.range_search(src_xyz, radius**2)
-                    global_ids = tgt_indices[I.astype(np.int64)]
-                    unique_ids = np.unique(global_ids)
-                    degrees[unique_ids] = target_deg
-                # 3. Zero unused SH coeffs
+                #     tgt_indices = np.where(tgt_mask.numpy())[0]
+                #     index = faiss.IndexFlatL2(3)
+                #     index.add(tgt_xyz)
+                #     LIMS, D, I = index.range_search(src_xyz, radius**2)
+                #     global_ids = tgt_indices[I.astype(np.int64)]
+                #     unique_ids = np.unique(global_ids)
+                #     degrees[unique_ids] = target_deg
+                # # 3. Zero unused SH coeffs
                 for deg in range(gaussians.max_sh_degree + 1):
                     cutoff = num_sh_coeffs(deg) - 1
                     mask = degrees == deg
@@ -282,17 +280,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
-            else:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.prune_only(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, gaussian_scores)
-
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+            elif iteration % opt.densification_interval == 0:
+                    gaussians.prune_only(1/255)
 
             # Optimizer step
             if iteration < opt.iterations:
