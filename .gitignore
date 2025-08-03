@@ -14,4 +14,4 @@ viewers
 models
 *.zip
 ALLMASKS
-outputnoneval
+output*

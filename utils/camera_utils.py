@@ -18,12 +18,6 @@ import os
 
 WARNED = False
 
-# def modify_path(file_path):
-#     dir_path, filename = os.path.split(file_path)  # Split into directory and filename
-#     parent_dir = os.path.dirname(dir_path)  # Get parent directory
-#     new_dir = os.path.join(parent_dir, "images_mask")  # Create new path
-#     return os.path.join(new_dir, filename)  # Join with filename
-
 def modify_path(file_path):
     dir_path, filename = os.path.split(file_path)  # Split into directory and filename
     parent_dir = os.path.dirname(dir_path)  # Get parent directory
@@ -35,60 +29,28 @@ def modify_path(file_path):
 
     return os.path.join(new_dir, new_filename)  # Return new full path
 
-
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    image = Image.open(cam_info.image_path)
-
-    # manipulate to get mask path, then load mask
     mask_path = modify_path(cam_info.image_path)
-    image_mask = Image.open(mask_path)
-
-    if cam_info.depth_path != "":
-        try:
-            if is_nerf_synthetic:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 512
-            else:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
-
-        except FileNotFoundError:
-            print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
-            raise
-        except IOError:
-            print(f"Error: Unable to open the image file '{cam_info.depth_path}'. It may be corrupted or an unsupported format.")
-            raise
-        except Exception as e:
-            print(f"An unexpected error occurred when trying to read depth at {cam_info.depth_path}: {e}")
-            raise
-    else:
-        invdepthmap = None
-        
+    image = Image.open(cam_info.image_path)
     orig_w, orig_h = image.size
-    if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
-        if args.resolution == -1:
-            if orig_w > 1600:
-                global WARNED
-                if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                    WARNED = True
-                global_down = orig_w / 1600
-            else:
-                global_down = 1
-        else:
-            global_down = orig_w / args.resolution
-    
 
+    # Compute resolution
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = (round(orig_w / (resolution_scale * args.resolution)),
+                      round(orig_h / (resolution_scale * args.resolution)))
+    else:
+        global_down = orig_w / (1600 if args.resolution == -1 and orig_w > 1600 else args.resolution)
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    return Camera(image_mask, resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
-                  image=image, invdepthmap=invdepthmap,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
-                  )
+    return Camera(image_path=cam_info.image_path,
+                  mask_path=mask_path,
+                  resolution=resolution,
+                  colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                  image_name=cam_info.image_name, uid=id,
+                  data_device=args.data_device)
+
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []

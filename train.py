@@ -18,7 +18,7 @@ import cv2
 import torch
 import torchvision.transforms as transforms
 
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, original_render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -28,8 +28,10 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import GaussianScoreTracker
+from GaussianGrowthTracker import GaussianGrowthTracker, RatioScalingGaussianGrowthTracker
 import faiss
 import numpy as np
+from scene.cameras import CameraManager
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -42,19 +44,9 @@ try:
     FUSED_SSIM_AVAILABLE = True
 except:
     FUSED_SSIM_AVAILABLE = False
-
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
-except:
-    SPARSE_ADAM_AVAILABLE = False
     
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
-
-    if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
-
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, memMB):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -72,37 +64,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    cameraManager = CameraManager(scene.getTrainCameras(), 40)
+    #growthTracker = GaussianGrowthTracker([30, 60], densify_until=opt.iterations)
+    growthTracker = RatioScalingGaussianGrowthTracker(ratios=[2.0, 1.0], total_memory_MB=memMB, densify_until=opt.densify_until_iter)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
-    viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
-    ema_Ll1depth_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
-
         iter_start.record()
-
-        #print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9:.3f} GB")
-        #print(f"Memory reserved: {torch.cuda.memory_reserved() / 1e9:.3f} GB")
 
         gaussians.update_learning_rate(iteration)
 
@@ -110,24 +82,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
-
-        # Render
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
+        viewpoint_cam = cameraManager.getNextCamera()
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        if iteration <= args.segIter:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+            gaussianScoreTracker.update(render_pkg["gaussian_scores"])
+        else:
+            render_pkg = original_render(viewpoint_cam, gaussians, pipe, bg)
+
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        #gaussian_scores = render_pkg["gaussian_scores"]
-        gaussianScoreTracker.update(render_pkg["gaussian_scores"])
 
 
         if viewpoint_cam.alpha_mask is not None:
@@ -136,168 +101,119 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        weight_mask = viewpoint_cam.mask.cuda()
-        #weight_mask = getWeightMask(gt_image, viewpoint_cam.image_name)
-        
-        # Replace L1 loss
-        #Ll1 = l1_loss(image, gt_image)
-        #LNew = new_loss(image, gt_image, weight_mask)
-        LNew = l1_loss(image, gt_image)
-        
-        # print("fused ssim avail: " + str(FUSED_SSIM_AVAILABLE))
+        Ll1 = l1_loss(image, gt_image)
+
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
 
-        # Replace total loss calculation
-        #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        loss = (1.0 - opt.lambda_dssim) * LNew + opt.lambda_dssim * (1.0 - ssim_value)
-        #loss = LNew
-
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         loss.backward()
-
 
         iter_end.record()
 
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            # Replace Ll1 & l1_loss function with new respective ones
-            #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            training_report(tb_writer, iteration, LNew, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            # assign SH degrees now
-            if iteration == 2000:
+            training_report(tb_writer, iteration, Ll1, loss, iter_start.elapsed_time(iter_end))
+
+            if iteration == args.segIter:
+                cameraManager.toggleMaskLoadingOff()
                 gaussian_scores = gaussianScoreTracker.get_scores()
 
-                # 1. Initial assignment
-                initial_degrees = torch.zeros_like(gaussian_scores, dtype=torch.int32)
-                initial_degrees[gaussian_scores > 0.15] = 3
-                initial_degrees[gaussian_scores <= 0.15] = 0
-                f_rest = gaussians._features_rest
-                def num_sh_coeffs(deg): return (deg + 1)**2
+                # 1. Set objectid = 1 if score > ..., else remain 0
+                objectid = torch.zeros_like(gaussian_scores, dtype=torch.int8)
+                objectid[gaussian_scores > args.segReq] = 1
 
                 xyz_all = gaussians.get_xyz.detach().cpu().numpy().astype('float32')
-                degrees = initial_degrees.cpu()
-                
-                # # Filter out floaters from initial degree-3 set
-                # print("eliminating floaters")
-                # floater_radius = 0.1 * scene.cameras_extent
-                # deg3_mask = (degrees == 3)
-                # deg3_xyz = xyz_all[deg3_mask]
-                # deg3_indices = np.where(deg3_mask.numpy())[0]
-                # index = faiss.IndexFlatL2(3)
-                # index.add(deg3_xyz)
-                # LIMS, _, _ = index.range_search(deg3_xyz, floater_radius**2)
-                # neighbor_counts = np.diff(LIMS)
-                # floaters = np.where(neighbor_counts < 10)[0]
-                # global_floater_ids = deg3_indices[floaters]
-                # degrees[global_floater_ids] = 0
+                objid_np = objectid.cpu().numpy()
 
-                # total_deg3 = deg3_mask.sum().item()
-                # num_eliminated = len(global_floater_ids)
-                # print(f"[SH Degree Prune] Eliminated {num_eliminated}/{total_deg3} floaters from initial degree-3 set.")
+                # 2. Expand objectid=1 via FAISS
+                print("expanding objectid 1 via radius search")
+                radius = args.segSpread * scene.cameras_extent
+                src_mask = (objid_np == 1)
+                tgt_mask = (objid_np == 0)
 
-
-                # expand SH degree 3 first
-                print("expanding degree 3")
-                radius = 0.05 * scene.cameras_extent
-                src_mask = (degrees == 3)
-                tgt_mask = (degrees < 3)
                 src_xyz = xyz_all[src_mask]
                 tgt_xyz = xyz_all[tgt_mask]
-                tgt_indices = np.where(tgt_mask.numpy())[0]
+                tgt_indices = np.where(tgt_mask)[0]
+
                 index = faiss.IndexFlatL2(3)
                 index.add(tgt_xyz)
                 LIMS, D, I = index.range_search(src_xyz, radius**2)
                 global_ids = tgt_indices[I.astype(np.int64)]
                 unique_ids = np.unique(global_ids)
-                degrees[unique_ids] = 3
+                objectid[unique_ids] = 1  # promote these to objectid 1
 
-                # radius = 0.3 * scene.cameras_extent
+                # 3. Assign SH degree based on objectid
+                degrees = torch.where(objectid == 1, torch.tensor(3, dtype=torch.int32, device='cuda'),
+                                                torch.tensor(0, dtype=torch.int32, device='cuda'))
 
-                # for source_deg in [3, 2]:
-                #     print("spreading degree")
-                #     target_deg = source_deg - 1
-                #     src_mask = (degrees == source_deg)
-                #     tgt_mask = (degrees < target_deg)
-
-                #     src_xyz = xyz_all[src_mask]
-                #     tgt_xyz = xyz_all[tgt_mask]
-                #     if len(src_xyz) == 0 or len(tgt_xyz) == 0:
-                #         continue
-
-                #     tgt_indices = np.where(tgt_mask.numpy())[0]
-                #     index = faiss.IndexFlatL2(3)
-                #     index.add(tgt_xyz)
-                #     LIMS, D, I = index.range_search(src_xyz, radius**2)
-                #     global_ids = tgt_indices[I.astype(np.int64)]
-                #     unique_ids = np.unique(global_ids)
-                #     degrees[unique_ids] = target_deg
-                # # 3. Zero unused SH coeffs
+                # 4. Zero unused SH coefficients
+                f_rest = gaussians._features_rest
+                def num_sh_coeffs(deg): return (deg + 1)**2
                 for deg in range(gaussians.max_sh_degree + 1):
                     cutoff = num_sh_coeffs(deg) - 1
-                    mask = degrees == deg
+                    mask = (degrees == deg)
                     f_rest[mask, cutoff:, :] = 0.0
 
-                gaussians._sh_degree = degrees.cuda()
+                # 5. Update model
+                gaussians.objectid = objectid.cuda()
+                gaussians._sh_degree = degrees
                 gaussians._features_rest = f_rest
 
             # Densification
             if iteration < opt.densify_until_iter:
-                gaussian_scores = gaussianScoreTracker.get_scores()
-
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    # Track growth and get thresholds
+                    with torch.no_grad():
+                        dens_thresh_multi = growthTracker.update(iteration, gaussians)
+                        print(f"dens thresh multi: {dens_thresh_multi}")
+
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, gaussian_scores)
-                
+
+                    gaussians.densify_and_prune(
+                        dens_thresh_multi,                       # tensor [num_objectids]
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        radii
+                    )
+                    
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
             elif iteration % opt.densification_interval == 0:
-                    gaussians.prune_only(1/255)
+                # Just record memory without applying threshold
+                growthTracker.updateOnly(iteration, gaussians)
+                gaussians.prune_only(1/255)
+
+            if iteration >= 5000 and iteration % 500 == 0:
+                gaussians.cull_sh_bands(1e-2)
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-                if use_sparse_adam:
-                    visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
-                    gaussians.optimizer.zero_grad(set_to_none = True)
-                else:
-                    gaussians.optimizer.step()
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+        
 
     with torch.no_grad():
         # _features_rest: (N, F, SH-1)
@@ -310,6 +226,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total = sh_rest.shape[0]
 
         print(f"\n[Training Complete] {count}/{total} Gaussians have SH>0 features zeroed out (degree 0 only).")
+
+    growthTracker.print_history()
 
     scene.save(iteration)
     scene.gaussians.produce_clusters(store_dict_path=scene.model_path)
@@ -340,46 +258,11 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, LNew, total_loss, new_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, total_loss, elapsed):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/LNew', LNew.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/Ll1', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', total_loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
-
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += new_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -397,6 +280,11 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--memMB", type=int, default = None)
+    parser.add_argument("--segIter", type=int, default = 500)
+    parser.add_argument("--segReq", type=float, default = 0.1)
+    parser.add_argument("--segSpread", type=float, default = 0.1)
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -405,11 +293,9 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    if not args.disable_viewer:
-        network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, 
+             args.start_checkpoint, args.debug_from, args.memMB)
 
     # All done
     print("\nTraining complete.")

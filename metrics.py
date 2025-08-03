@@ -48,9 +48,11 @@ def evaluate(model_paths):
         full_dict_polytopeonly[scene_dir] = {}
         per_view_dict_polytopeonly[scene_dir] = {}
 
-        test_dir = Path(scene_dir) / "train"
+        test_dir = Path(scene_dir) / "test"
 
         for method in os.listdir(test_dir):
+            if method == "masks":
+                continue
             print("Method:", method)
 
             full_dict[scene_dir][method] = {}

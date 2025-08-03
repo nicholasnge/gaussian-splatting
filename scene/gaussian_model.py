@@ -23,12 +23,8 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, pcast_i16_to_f32
 from GaussianScoreScaler import GaussianScoreScaler
 from collections import OrderedDict
-from diff_gaussian_rasterization._C import kmeans_cuda
-
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-except:
-    pass
+from original_diff_gaussian_rasterization._C import kmeans_cuda
+import math
 
 class Codebook():
     def __init__(self, ids, centers):
@@ -89,6 +85,7 @@ class GaussianModel:
 
         # NEW
         self._sh_degree = torch.empty(0)
+        self.objectid = torch.zeros(0)
 
     def capture(self):
         return (
@@ -206,6 +203,7 @@ class GaussianModel:
 
         #NEW
         self._sh_degree = torch.full((fused_point_cloud.shape[0],), self.max_sh_degree, dtype=torch.int32, device="cuda")
+        self.objectid = torch.zeros((fused_point_cloud.shape[0],), dtype=torch.int8, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -454,62 +452,6 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    # def load_ply(self, path, use_train_test_exp = False):
-    #     plydata = PlyData.read(path)
-    #     if use_train_test_exp:
-    #         exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
-    #         if os.path.exists(exposure_file):
-    #             with open(exposure_file, "r") as f:
-    #                 exposures = json.load(f)
-    #             self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
-    #             print(f"Pretrained exposures loaded.")
-    #         else:
-    #             print(f"No exposure to be loaded at {exposure_file}")
-    #             self.pretrained_exposures = None
-
-    #     xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
-    #                     np.asarray(plydata.elements[0]["y"]),
-    #                     np.asarray(plydata.elements[0]["z"])),  axis=1)
-    #     opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-
-    #     features_dc = np.zeros((xyz.shape[0], 3, 1))
-    #     features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-    #     features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-    #     features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
-
-    #     extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
-    #     extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-    #     assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-    #     features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-    #     for idx, attr_name in enumerate(extra_f_names):
-    #         features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-    #     # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-    #     features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
-
-    #     scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
-    #     scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
-    #     scales = np.zeros((xyz.shape[0], len(scale_names)))
-    #     for idx, attr_name in enumerate(scale_names):
-    #         scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-    #     rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
-    #     rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
-    #     rots = np.zeros((xyz.shape[0], len(rot_names)))
-    #     for idx, attr_name in enumerate(rot_names):
-    #         rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-    #     self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-    #     self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-    #     self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-    #     self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-    #     self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-    #     self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
-    #     self.active_sh_degree = self.max_sh_degree
-
-    #     #NEW
-    #     self._sh_degree = torch.full((xyz.shape[0],), self.max_sh_degree, dtype=torch.int32, device="cuda")
-
     def _parse_vertex_group(self,
                             vertex_group,
                             sh_degree,
@@ -723,6 +665,7 @@ class GaussianModel:
         
         #NEW
         self._sh_degree = self._sh_degree[valid_points_mask]
+        self.objectid = self.objectid[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -746,7 +689,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_sh_degree):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_sh_degree, new_objectid):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -769,27 +712,17 @@ class GaussianModel:
 
         #NEW
         self._sh_degree = torch.cat((self._sh_degree, new_sh_degree))
+        self.objectid = torch.cat((self.objectid, new_objectid))
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, gaussian_scores, N=2):
+    def densify_and_split(self, grads, grad_threshold, dens_thresh_multi, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         
         # Threshold multiplier per SH degree: SH3:1.0, SH2:1.3, SH1:1.7, SH0:2.0
-        scales = torch.tensor([2.0, 1.7, 1.3, 1.0], device="cuda")
-        scaled_thresh = grad_threshold * scales[self._sh_degree]
+        scaled_thresh = grad_threshold * dens_thresh_multi[self.objectid.int()]
         selected_pts_mask = padded_grad >= scaled_thresh
-
-        
-        #selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        
-        #adjusted_grad_threshold = grad_threshold
-        # adjusted_grad_threshold = GaussianScoreScaler.sqrt(grad_threshold, gaussian_scores, n_init_points, alpha=1)
-        # selected_pts_mask = padded_grad >= adjusted_grad_threshold
-        
-        # selected_pts_mask = torch.logical_and(selected_pts_mask,
-        #                                       torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -804,30 +737,19 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
         #NEW
-        new_sh_degree = self._sh_degree[selected_pts_mask].repeat_interleave(N)
+        new_sh_degree = self._sh_degree[selected_pts_mask].repeat(N)
+        new_objectid = self.objectid[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_sh_degree)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_sh_degree, new_objectid)
 
         # this pruning is to remove the original gaussian that split
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, gaussian_scores):
+    def densify_and_clone(self, grads, grad_threshold, dens_thresh_multi, scene_extent):
         
-        scales = torch.tensor([2.0, 1.7, 1.3, 1.0], device="cuda")
-        scaled_thresh = grad_threshold * scales[self._sh_degree]
+        scaled_thresh = grad_threshold * dens_thresh_multi[self.objectid.int()]
         selected_pts_mask = torch.norm(grads, dim=-1) >= scaled_thresh
-
-        
-        # Extract points that satisfy the gradient condition
-        #selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        
-        # adjusted_grad_threshold = GaussianScoreScaler.sqrt(grad_threshold, gaussian_scores, self.get_xyz.shape[0], alpha=1)
-        # selected_pts_mask = torch.norm(grads, dim=-1) >= adjusted_grad_threshold
-        
-        # selected_pts_mask = torch.logical_and(selected_pts_mask,
-        #                                       torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        # selected_pts_mask = torch.logical_and(selected_pts_mask, self._sh_degree == 3)
 
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -839,22 +761,18 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
         #NEW
         new_sh_degree = self._sh_degree[selected_pts_mask]
+        new_objectid = self.objectid[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_sh_degree)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_sh_degree, new_objectid)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, gaussian_scores):
+    def densify_and_prune(self, dens_thresh_multi, max_grad, min_opacity, extent, max_screen_size, radii):
         """Densification process with gradient thresholding and pruning."""
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        # Compute percentiles for monitoring
-        with torch.no_grad():
-            stats = [torch.quantile(gaussian_scores, p).item() for p in [0.25, 0.5, 0.75, 0.85, 0.95, 1.0]]
-            print(f"Gaussian Stats: 25th={stats[0]:.3f}, median={stats[1]:.3f}, 75th={stats[2]:.3f}, 85th={stats[3]:.3f}, 95th={stats[4]:.3f}, max={stats[5]:.3f}")
-
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent, gaussian_scores)
-        self.densify_and_split(grads, max_grad, extent, gaussian_scores)
+        self.densify_and_clone(grads, max_grad, dens_thresh_multi, extent)
+        self.densify_and_split(grads, max_grad, dens_thresh_multi, extent)
 
         #this pruning is to remove not useful gaussians
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -897,3 +815,39 @@ class GaussianModel:
             torch.save(codebook_dict, os.path.join(store_dict_path, 'codebook.pt'))
         
         self._codebook_dict = codebook_dict
+
+
+    def cull_sh_bands(self, threshold=1e-2):
+        f_rest = self._features_rest
+        sh_degrees = self._sh_degree
+
+        reassigned_degrees = sh_degrees.clone()
+        features_rest = f_rest.clone()
+
+        coeff_ranges = {
+            1: slice(0, 3),
+            2: slice(3, 8),
+            3: slice(8, 15),
+        }
+
+        for deg in reversed(range(1, 4)):
+            mask = reassigned_degrees == deg
+            if mask.sum() == 0:
+                continue
+
+            coeffs = features_rest[mask].transpose(1, 2)  # [N, 3, num_coeffs]
+            coeff_slice = coeff_ranges[deg]
+            coeff_norm = torch.norm(coeffs[:, :, coeff_slice], dim=(1, 2))
+
+            coeff_count = 3 * ((deg + 1)**2 - 1)
+            norm_per_coeff = coeff_norm / math.sqrt(coeff_count)
+            demote_mask = norm_per_coeff < threshold
+            selected_indices = mask.nonzero(as_tuple=True)[0][demote_mask]
+
+            print(f"Demoting {selected_indices.numel()} Gaussians from SH{deg} → SH{deg-1}")
+
+            reassigned_degrees[selected_indices] -= 1
+            features_rest[selected_indices, coeff_slice] = 0
+
+        self._sh_degree = reassigned_degrees
+        self._features_rest = features_rest
