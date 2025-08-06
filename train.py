@@ -14,7 +14,6 @@ import torch
 from random import randint
 # import new loss which considers weighted mask
 from utils.loss_utils import l1_loss, ssim
-import cv2
 import torch
 import torchvision.transforms as transforms
 
@@ -230,10 +229,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     growthTracker.print_history()
 
     scene.save(iteration)
-    scene.gaussians.produce_clusters(store_dict_path=scene.model_path)
-    scene.save_separate(iteration)        
-    scene.save(iteration, quantise=True)
-    scene.save(iteration, quantise=True, half_float=True)
+    #scene.gaussians.produce_clusters(store_dict_path=scene.model_path)
+    #scene.save_separate(iteration)        
+    #scene.save(iteration, quantise=True)
+    #scene.save(iteration, quantise=True, half_float=True)
 
 
 def prepare_output_and_logger(args):    

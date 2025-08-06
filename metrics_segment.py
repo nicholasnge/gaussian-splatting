@@ -4,8 +4,6 @@ from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
 from utils.loss_utils import segmented_ssim
-from lpipsPyTorch import lpips
-import json
 from tqdm import tqdm
 from utils.image_utils import segmented_psnr
 from argparse import ArgumentParser
@@ -18,7 +16,6 @@ def evaluate(model_paths):
     per_view_dict = {}
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
-    print("")
 
     for scene_dir in model_paths:
         print("Scene:", scene_dir)
@@ -28,8 +25,8 @@ def evaluate(model_paths):
         per_view_dict_polytopeonly[scene_dir] = {}
 
         test_dir = Path(scene_dir) / "test"
-        mask_dir = Path(test_dir) / "masks" 
-
+        mask_dir = Path(args.mask[0]) if args.mask else Path(f"./{Path(scene_dir).name}")
+        
         for method in os.listdir(test_dir):
             if method == "masks":
                 continue
@@ -85,5 +82,6 @@ def evaluate(model_paths):
 if __name__ == "__main__":
     parser = ArgumentParser(description="Evaluate segmented image metrics")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    parser.add_argument('--mask', required=False, nargs=1, type=str)    
     args = parser.parse_args()
     evaluate(args.model_paths)
